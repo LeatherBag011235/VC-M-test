@@ -6,6 +6,7 @@ from datetime import datetime
 import json
 from multiprocessing import Pool, cpu_count
 
+from src.crawlers.yc_crawler import YCCrawler
 from src.logging_config import logger
 
 
@@ -57,31 +58,22 @@ class Parser:
                 incomplete_rows.append(company)
                 continue
 
-            checks = []
-
-            for col, dtype in self.actual_fields.items():
-                if dtype == pl.Utf8:
-                    checks.append(
-                        (pl.col(col).is_not_null()) & (pl.col(col).str.strip_chars().str.len_bytes() > 0)
-                    )
-                else:
-                    checks.append(pl.col(col).is_not_null())
-
-            # Check if there is at least one missing value in a row
-            if not row.select(checks).row(0).count(True) == len(self.actual_fields):
+            null_count = row.null_count().sum_horizontal().item()
+            if null_count > 0:
                 incomplete_rows.append(company)
 
         return incomplete_rows
     
     def run(self):
         incomplete_rows = self._incomplet_rows()
-
-        tasks = [(company, self.actual_fields) for company in incomplete_rows]
         
-        with Pool(processes=cpu_count() - 1) as pool:
+        tasks = [(company, self.actual_fields) for company in incomplete_rows]
+
+        with Pool(processes=max(cpu_count() - 1, 10)) as pool:
             new_records = pool.map(Parser.process_company, tasks)
 
         new_rows = pl.DataFrame([r for r in new_records if r is not None])
+    
         new_slugs = new_rows["slug"]
 
         existing_filtered = self.existing_index.filter(
@@ -94,18 +86,20 @@ class Parser:
     @staticmethod
     def process_company(args):
         company, actual_fields, = args
-
         slug = company["slug"]
-        #crawl here
+
+        linkedin_url = YCCrawler(slug).get_linkedin_url()  
+
         record = {
             "slug": slug,
             "name": company["name"],
-            "website": company.get("website", ""),
-            "long_description": company.get("long_description", ""),
+            "website": company.get("website"),
+            "long_description": company.get("long_description"),
             "yc_url": company["url"],
-            "linkedin_url": company.get("linkedin", ""),
+            "linkedin_url": linkedin_url if linkedin_url else None, 
             "s25_tag" : False
         }
+
         return record
 
     def update(self):

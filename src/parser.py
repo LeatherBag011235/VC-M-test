@@ -4,6 +4,7 @@ import polars as pl
 from pathlib import Path
 from datetime import datetime
 import json
+from multiprocessing import Pool, cpu_count
 
 from src.logging_config import logger
 
@@ -21,7 +22,7 @@ class Parser:
             "slug" : pl.Utf8,
             "name" : pl.Utf8,
             "website": pl.Utf8, 
-            "description_yc" : pl.Utf8, 
+            "long_description" : pl.Utf8, 
             "yc_url" : pl.Utf8,  
             "linkedin_url" : pl.Utf8, 
             "s25_tag": pl.Boolean,
@@ -39,58 +40,73 @@ class Parser:
 
         self.all_companies = requests.get(self.api_url).json()
 
-    @staticmethod
-    def is_row_complete(row: pl.DataFrame, column_types: dict) -> bool:
-        """
-        Returns True if the row has no missing values, where:
-        - Nulls and empty/whitespace strings are considered missing
-        - False/0 are valid
-        """
-        if row.is_empty():
-            return False
+    def _incomplet_rows(self):
+        incomplete_rows = []
 
-        checks = []
+        for company in self.all_companies:
 
-        for col, dtype in column_types.items():
-            if dtype == pl.Utf8:
-                checks.append(
-                    (pl.col(col).is_not_null()) & (pl.col(col).str.strip_chars().str.len_bytes() > 0)
-                )
-            else:
-                checks.append(pl.col(col).is_not_null())
+            slug = company["slug"]
 
-        return row.select(checks).row(0).count(True) == len(column_types)
+            row = self.existing_index.select(
+                self.actual_fields.keys()
+            ).filter(
+                pl.col("slug") == slug
+            )
+
+            if row.is_empty():
+                incomplete_rows.append(company)
+                continue
+
+            checks = []
+
+            for col, dtype in self.actual_fields.items():
+                if dtype == pl.Utf8:
+                    checks.append(
+                        (pl.col(col).is_not_null()) & (pl.col(col).str.strip_chars().str.len_bytes() > 0)
+                    )
+                else:
+                    checks.append(pl.col(col).is_not_null())
+
+            # Check if there is at least one missing value in a row
+            if not row.select(checks).row(0).count(True) == len(self.actual_fields):
+                incomplete_rows.append(company)
+
+        return incomplete_rows
     
     def run(self):
-        for company in self.all_companies:
-            slug = company["slug"]
-            existing_index_slice = self.existing_index.select(
-                self.actual_fields.keys()
-                ).filter(
-                    pl.col("slug") == slug
-                    )
+        incomplete_rows = self._incomplet_rows()
 
-            complete = Parser.is_row_complete(existing_index_slice, self.actual_fields)
+        tasks = [(company, self.actual_fields) for company in incomplete_rows]
+        
+        with Pool(processes=cpu_count() - 1) as pool:
+            new_records = pool.map(Parser.process_company, tasks)
 
-            if complete:
-                continue 
+        new_rows = pl.DataFrame([r for r in new_records if r is not None])
+        new_slugs = new_rows["slug"]
 
-            # Add crawling logic here
+        existing_filtered = self.existing_index.filter(
+            ~pl.col("slug").is_in(new_slugs)
+        )
 
-            record = {
-                "slug": slug,
-                "name": company["name"],
-                "website": company.get("website", ""),
-                "description_yc": company.get("description", ""),
-                "yc_url": company["url"],
-                "linkedin_url": company.get("linkedin", ""),
-                "s25_tag" : False
-            }
+        self.existing_index = existing_filtered.vstack(new_rows)
+        return self.existing_index
+    
+    @staticmethod
+    def process_company(args):
+        company, actual_fields, = args
 
-            add_df = pl.DataFrame(record)
-            self.existing_index = self.existing_index.vstack(add_df)
-
-            logger.debug(f"{record["name"]} is updated")
+        slug = company["slug"]
+        #crawl here
+        record = {
+            "slug": slug,
+            "name": company["name"],
+            "website": company.get("website", ""),
+            "long_description": company.get("long_description", ""),
+            "yc_url": company["url"],
+            "linkedin_url": company.get("linkedin", ""),
+            "s25_tag" : False
+        }
+        return record
 
     def update(self):
         updates_count = len(self.existing_index) - self.existing_count
@@ -100,5 +116,3 @@ class Parser:
             logger.info(f"{updates_count} updated in total")
         else: 
             logger.info(f"No updates")
-
-

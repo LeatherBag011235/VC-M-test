@@ -1,0 +1,14 @@
+name: vcm_env
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - pandas
+  - pip
+  - beautifulsoup4
+  - requests
+  - lxml
+  - pip:
+      - polars
+      - streamlit
